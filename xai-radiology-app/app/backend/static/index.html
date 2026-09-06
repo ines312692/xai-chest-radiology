@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XAI Chest Radiology</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --ink: #101a24; --muted: #64748b; --line: #e2e8f0; --bg: #f1f5f9;
+    --surface: #fff; --accent: #1e4d78; --accent-soft: #eaf1f8;
+    --alert: #b3382f; --alert-soft: #fdeceb; --ok: #2b7a58; --ok-soft: #e9f6ef;
+    --radius: 12px; --shadow: 0 1px 2px rgba(16,26,36,.04), 0 6px 20px rgba(16,26,36,.06);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink); line-height: 1.55;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    background: var(--surface); border-bottom: 1px solid var(--line);
+    padding: 18px 30px; display: flex; align-items: center; gap: 14px;
+  }
+  .logo {
+    width: 38px; height: 38px; border-radius: 9px; flex: none; background: var(--accent);
+    color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 15px;
+  }
+  header h1 { margin: 0; font-size: 17px; letter-spacing: -.1px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+  main { max-width: 1120px; margin: 26px auto 60px; padding: 0 22px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 22px; margin-bottom: 20px;
+  }
+  .section-label {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .7px;
+    color: var(--muted); font-weight: 650; margin: 0 0 8px;
+  }
+
+  /* Model selector */
+  .segmented { display: inline-flex; background: var(--bg); border-radius: 9px; padding: 4px; gap: 4px; }
+  .segmented button {
+    background: transparent; color: var(--muted); border: 0; border-radius: 7px;
+    padding: 8px 16px; font-size: 13.5px; font-weight: 550; cursor: pointer; transition: .15s;
+  }
+  .segmented button.active { background: var(--surface); color: var(--accent); box-shadow: 0 1px 3px rgba(16,26,36,.12); }
+  .segmented button:disabled { opacity: .45; cursor: not-allowed; }
+  #model-desc { font-size: 12.5px; color: var(--muted); margin: 10px 0 0; }
+  .divider { height: 1px; background: var(--line); margin: 18px 0; }
+
+  /* Upload */
+  .uploader { display: grid; grid-template-columns: 180px 1fr; gap: 20px; align-items: center; }
+  .uploader.empty { grid-template-columns: 1fr; }
+  #preview-wrap { position: relative; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); background: #0b1220; aspect-ratio: 1; }
+  #preview { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #preview-name {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 9px; color: #fff;
+    background: linear-gradient(transparent, rgba(0,0,0,.75)); font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #drop {
+    border: 2px dashed #c7d3e0; border-radius: 10px; padding: 28px 22px; text-align: center;
+    cursor: pointer; transition: .16s; background: #fafcfe;
+  }
+  #drop.hover { border-color: var(--accent); background: var(--accent-soft); }
+  #drop strong { font-size: 15px; display: block; margin-bottom: 4px; }
+  #drop span { color: var(--muted); font-size: 13px; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  button.primary {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 11px 22px;
+    font-size: 14px; font-weight: 500; cursor: pointer; transition: .15s;
+  }
+  button.primary:hover:not(:disabled) { background: #17406a; }
+  button.primary:disabled { background: #b6c4d3; cursor: not-allowed; }
+  button.ghost {
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 18px; font-size: 14px; cursor: pointer;
+  }
+  button.ghost:hover:not(:disabled) { background: var(--bg); color: var(--ink); }
+  .checkline { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); }
+  .warn { margin-top: 12px; font-size: 12.5px; color: #8a5a11; background: #fdf5e6;
+          border: 1px solid #f0dcae; border-radius: 8px; padding: 9px 12px; }
+  .error { color: var(--alert); font-size: 13.5px; margin-top: 10px; }
+
+  /* Result */
+  .banner {
+    border-radius: 10px; padding: 15px 18px; margin-bottom: 18px; display: flex;
+    justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
+    border: 1px solid transparent;
+  }
+  .banner.positive { background: var(--alert-soft); border-color: #f2c9c5; color: var(--alert); }
+  .banner.negative { background: var(--ok-soft); border-color: #bfe3d0; color: var(--ok); }
+  .banner .label { font-size: 18px; font-weight: 650; letter-spacing: -.2px; }
+  .banner .meta { font-size: 12.5px; color: var(--muted); text-align: right; }
+  .confbar { height: 5px; border-radius: 3px; background: #dbe3ec; margin-top: 8px; width: 200px; overflow: hidden; }
+  .confbar i { display: block; height: 100%; background: currentColor; }
+
+  .probs { margin-bottom: 18px; }
+  .prob-row { display: grid; grid-template-columns: 130px 1fr 48px; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
+  .prob-row .track { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; }
+  .prob-row .track i { display: block; height: 100%; background: #a8bccf; }
+  .prob-row.top .track i { background: var(--accent); }
+  .prob-row.top { font-weight: 600; }
+  .prob-row .val { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 780px) { .panels, .uploader { grid-template-columns: 1fr; } }
+  .panel h3 { margin: 0 0 8px; font-size: 11.5px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); font-weight: 650; }
+  .panel img {
+    width: 100%; max-height: 340px; object-fit: contain; background: #0b1220;
+    border-radius: 10px; border: 1px solid var(--line); display: block; cursor: zoom-in;
+    transition: .15s;
+  }
+  .panel img:hover { border-color: var(--accent); }
+  .panel .cap { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .panel .panel-head {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  }
+  .icon-btn {
+    background: transparent; border: 1px solid var(--line); border-radius: 6px;
+    color: var(--muted); font-size: 11.5px; padding: 3px 9px; cursor: pointer;
+  }
+  .icon-btn:hover { background: var(--bg); color: var(--accent); border-color: var(--accent); }
+
+  /* Lightbox */
+  #lightbox {
+    position: fixed; inset: 0; background: rgba(10,16,24,.92); z-index: 100;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px; gap: 14px;
+  }
+  #lightbox img {
+    max-width: 92vw; max-height: 80vh; border-radius: 10px; cursor: zoom-out;
+    box-shadow: 0 10px 50px rgba(0,0,0,.5);
+  }
+  #lightbox .lb-bar { display: flex; align-items: center; gap: 14px; color: #dbe6f0; font-size: 13px; }
+  #lightbox .lb-bar button {
+    background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.25);
+    color: #fff; border-radius: 7px; padding: 8px 16px; font-size: 13px; cursor: pointer;
+  }
+  #lightbox .lb-bar button:hover { background: rgba(255,255,255,.22); }
+  .text-block {
+    margin-top: 18px; padding: 16px 18px; background: #fafcfe; border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: 8px; font-size: 14.5px;
+  }
+  .text-block h3 { margin: 0 0 6px; font-size: 11.5px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); font-weight: 650; }
+  .disclaimer { margin-top: 16px; font-size: 11.5px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 12px; }
+  .spinner { width: 24px; height: 24px; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 12px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .fade { animation: fade .35s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } }
+    .hidden, #lightbox.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">XAI</div>
+  <div>
+    <h1>Explainable AI for Chest Radiology</h1>
+    <p>Classification, Grad-CAM visual explanation, and text conditioned report generation. Master research prototype.</p>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <p class="section-label">Diagnostic model</p>
+    <div class="segmented" id="model-picker"></div>
+    <p id="model-desc"></p>
+
+    <div class="divider"></div>
+
+    <div class="uploader empty" id="uploader">
+      <div id="preview-wrap" class="hidden">
+        <img id="preview" alt="selected radiograph">
+        <div id="preview-name"></div>
+      </div>
+      <div>
+        <div id="drop">
+          <strong>Drop a chest radiograph here, or click to browse</strong>
+          <span>PNG or JPEG, up to 20 MB. Use an original radiograph, not a heatmap.</span>
+        </div>
+        <div class="actions">
+          <button id="run" class="primary" disabled>Analyse</button>
+          <button id="clear" class="ghost hidden">Choose another</button>
+          <label class="checkline">
+            <input type="checkbox" id="compare"> Compare with the other model
+          </label>
+        </div>
+        <p id="warn" class="warn hidden"></p>
+        <p id="error" class="error"></p>
+      </div>
+    </div>
+    <input id="file" type="file" accept="image/png,image/jpeg" class="hidden">
+  </section>
+
+  <section id="loading" class="card hidden" style="text-align:center">
+    <div class="spinner"></div>
+    <p style="color:var(--muted);font-size:13.5px;margin:0" id="loading-text">
+      Running the classifier, computing Grad-CAM, and writing the explanation
+    </p>
+  </section>
+
+  <section id="results" class="card hidden">
+    <div id="banner" class="banner">
+      <div>
+        <div class="label" id="label"></div>
+        <div class="confbar"><i id="confbar-fill"></i></div>
+      </div>
+      <div class="meta" id="meta"></div>
+    </div>
+
+    <div class="probs hidden" id="probs">
+      <p class="section-label">Class probabilities</p>
+      <div id="prob-list"></div>
+    </div>
+
+    <div class="panels">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Input radiograph</h3>
+          <button class="icon-btn" data-download="original">Download</button>
+        </div>
+        <img id="original" alt="uploaded radiograph">
+        <p class="cap">Click the image to enlarge.</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h3 id="heatmap-title">Visual explanation, Grad-CAM</h3>
+          <button class="icon-btn" data-download="heatmap">Download</button>
+        </div>
+        <img id="heatmap" alt="grad-cam heatmap">
+        <p class="cap" id="heatmap-cap"></p>
+      </div>
+    </div>
+
+    <div id="comparisons" class="hidden">
+      <div class="divider"></div>
+      <p class="section-label">Same radiograph seen by the other model</p>
+      <div class="panels" id="comparison-panels"></div>
+    </div>
+
+    <div class="text-block">
+      <h3>Textual explanation</h3>
+      <p id="text" style="margin:0"></p>
+    </div>
+
+    <p class="disclaimer" id="disclaimer"></p>
+  </section>
+
+  <div id="lightbox" class="hidden">
+    <img id="lightbox-img" alt="enlarged view">
+    <div class="lb-bar">
+      <span id="lightbox-caption"></span>
+      <button id="lightbox-download">Download</button>
+      <button id="lightbox-close">Close</button>
+    </div>
+  </div>
+</main>
+
+<script>
+// Empty when the page is served by the backend. Set to http://localhost:8000
+// when the file is opened directly from disk.
+const API_BASE = "";
+
+const uploader = document.getElementById("uploader");
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("file");
+const runButton = document.getElementById("run");
+const clearButton = document.getElementById("clear");
+const compareBox = document.getElementById("compare");
+const previewWrap = document.getElementById("preview-wrap");
+const preview = document.getElementById("preview");
+const previewName = document.getElementById("preview-name");
+const warnBox = document.getElementById("warn");
+const errorBox = document.getElementById("error");
+const picker = document.getElementById("model-picker");
+const modelDesc = document.getElementById("model-desc");
+
+let selectedFile = null;
+let modelCatalog = [];
+let currentModel = null;
+
+// Build the model selector from what the backend actually serves
+async function loadModels() {
+  try {
+    const response = await fetch(API_BASE + "/models");
+    const data = await response.json();
+    modelCatalog = data.models;
+    currentModel = data.default;
+    // Fall back to any available model when the default checkpoint is missing
+    if (!modelCatalog.find(m => m.id === currentModel && m.available)) {
+      const firstAvailable = modelCatalog.find(m => m.available);
+      currentModel = firstAvailable ? firstAvailable.id : null;
+    }
+    picker.innerHTML = "";
+    modelCatalog.forEach(model => {
+      const button = document.createElement("button");
+      button.textContent = model.name;
+      button.disabled = !model.available;
+      button.title = model.available ? model.description : "Checkpoint not found";
+      if (model.id === currentModel) button.classList.add("active");
+      button.addEventListener("click", () => selectModel(model.id));
+      picker.appendChild(button);
+    });
+    updateModelDescription();
+    compareBox.parentElement.style.display =
+      modelCatalog.filter(m => m.available).length > 1 ? "flex" : "none";
+  } catch (err) {
+    modelDesc.textContent = "Could not reach the service. Is the backend running?";
+  }
+}
+
+function selectModel(modelId) {
+  currentModel = modelId;
+  [...picker.children].forEach((button, index) =>
+    button.classList.toggle("active", modelCatalog[index].id === modelId));
+  updateModelDescription();
+  document.getElementById("results").classList.add("hidden");
+}
+
+function updateModelDescription() {
+  const model = modelCatalog.find(m => m.id === currentModel);
+  if (!model) { modelDesc.textContent = "No checkpoint available."; return; }
+  modelDesc.textContent = model.description
+    + "  Classes: " + model.classes.join(", ") + ".";
+}
+
+drop.addEventListener("click", () => fileInput.click());
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("hover"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("hover"));
+drop.addEventListener("drop", e => {
+  e.preventDefault(); drop.classList.remove("hover");
+  if (e.dataTransfer.files.length) selectFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener("change", () => {
+  if (fileInput.files.length) selectFile(fileInput.files[0]);
+});
+clearButton.addEventListener("click", reset);
+
+function reset() {
+  selectedFile = null;
+  fileInput.value = "";
+  previewWrap.classList.add("hidden");
+  clearButton.classList.add("hidden");
+  warnBox.classList.add("hidden");
+  uploader.classList.add("empty");
+  runButton.disabled = true;
+  errorBox.textContent = "";
+  document.getElementById("results").classList.add("hidden");
+}
+
+function selectFile(file) {
+  selectedFile = file;
+  errorBox.textContent = "";
+  previewName.textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = e => {
+    preview.src = e.target.result;
+    previewWrap.classList.remove("hidden");
+    uploader.classList.remove("empty");
+    clearButton.classList.remove("hidden");
+    checkIfColored(e.target.result);
+  };
+  reader.readAsDataURL(file);
+  runButton.disabled = false;
+}
+
+// A radiograph is grayscale. A strongly colored image is very likely a heatmap or a
+// screenshot, which the classifier was never trained on, so we warn the user.
+function checkIfColored(dataUrl) {
+  const img = new Image();
+  img.onload = () => {
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0, size, size);
+    const data = ctx.getImageData(0, 0, size, size).data;
+    let colored = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const max = Math.max(data[i], data[i+1], data[i+2]);
+      const min = Math.min(data[i], data[i+1], data[i+2]);
+      if (max - min > 40) colored++;
+    }
+    if (colored / (size * size) > 0.10) {
+      warnBox.textContent = "This image looks colored rather than grayscale. It may be "
+        + "a heatmap or a screenshot. The classifier expects an original chest "
+        + "radiograph, so the result may not be meaningful.";
+      warnBox.classList.remove("hidden");
+    } else {
+      warnBox.classList.add("hidden");
+    }
+  };
+  img.src = dataUrl;
+}
+
+runButton.addEventListener("click", async () => {
+  if (!selectedFile || !currentModel) return;
+  runButton.disabled = true;
+  errorBox.textContent = "";
+  document.getElementById("results").classList.add("hidden");
+  document.getElementById("loading-text").textContent = compareBox.checked
+    ? "Running every model, computing Grad-CAM, and writing the explanation"
+    : "Running the classifier, computing Grad-CAM, and writing the explanation";
+  document.getElementById("loading").classList.remove("hidden");
+  document.getElementById("original").src = preview.src;
+
+  const form = new FormData();
+  form.append("file", selectedFile);
+  form.append("model_id", currentModel);
+  form.append("compare", compareBox.checked ? "true" : "false");
+
+  try {
+    const response = await fetch(API_BASE + "/analyze", { method: "POST", body: form });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(detail.detail || "Request failed");
+    }
+    render(await response.json());
+  } catch (err) {
+    errorBox.textContent = "Analysis failed: " + err.message;
+  } finally {
+    document.getElementById("loading").classList.add("hidden");
+    runButton.disabled = false;
+  }
+});
+
+function render(data) {
+  const isPositive = data.label !== data.negative_class;
+  const banner = document.getElementById("banner");
+  banner.className = "banner " + (isPositive ? "positive" : "negative");
+  document.getElementById("label").textContent =
+    data.label.replace("_", " ") + " · " + (data.confidence * 100).toFixed(1) + "%";
+  document.getElementById("confbar-fill").style.width = (data.confidence * 100) + "%";
+  document.getElementById("meta").innerHTML =
+    data.model_name + "<br>Most influential region<br><strong>" + data.peak_zone
+    + "</strong><br>text by " + data.generator;
+
+  // The probability breakdown is only informative beyond two classes
+  const probs = document.getElementById("probs");
+  const list = document.getElementById("prob-list");
+  list.innerHTML = "";
+  if (data.probabilities.length > 2) {
+    const best = Math.max(...data.probabilities.map(p => p.probability));
+    data.probabilities.forEach(p => {
+      const row = document.createElement("div");
+      row.className = "prob-row" + (p.probability === best ? " top" : "");
+      row.innerHTML = "<span>" + p.label.replace("_", " ") + "</span>"
+        + "<span class='track'><i style='width:" + (p.probability * 100) + "%'></i></span>"
+        + "<span class='val'>" + (p.probability * 100).toFixed(1) + "%</span>";
+      list.appendChild(row);
+    });
+    probs.classList.remove("hidden");
+  } else {
+    probs.classList.add("hidden");
+  }
+
+  document.getElementById("heatmap").src =
+    "data:image/png;base64," + data.heatmap_png_base64;
+  document.getElementById("heatmap-cap").textContent =
+    "Explains the " + data.label.replace("_", " ") + " score of " + data.model_name + ".";
+  document.getElementById("text").textContent = data.explanation_text;
+  document.getElementById("disclaimer").textContent = data.disclaimer;
+
+  // Comparison panels, one per other model that also analysed the image
+  const comparisons = document.getElementById("comparisons");
+  const panels = document.getElementById("comparison-panels");
+  panels.innerHTML = "";
+  if (data.comparisons && data.comparisons.length) {
+    data.comparisons.forEach(other => {
+      const panel = document.createElement("div");
+      panel.className = "panel";
+      panel.innerHTML = "<h3>" + other.model_name + "</h3>"
+        + "<img src='data:image/png;base64," + other.heatmap_png_base64 + "'>"
+        + "<p class='cap'><strong>" + other.label.replace("_", " ") + "</strong> · "
+        + (other.confidence * 100).toFixed(1) + "% · peak in " + other.peak_zone + "</p>";
+      panels.appendChild(panel);
+    });
+    comparisons.classList.remove("hidden");
+  } else {
+    comparisons.classList.add("hidden");
+  }
+
+  const results = document.getElementById("results");
+  results.classList.remove("hidden", "fade");
+  void results.offsetWidth;
+  results.classList.add("fade");
+  results.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Lightbox and download. Any image of a result panel can be enlarged and saved,
+// which is useful when a heatmap goes into the thesis or a slide.
+const lightbox = document.getElementById("lightbox");
+const lightboxImg = document.getElementById("lightbox-img");
+const lightboxCaption = document.getElementById("lightbox-caption");
+
+function downloadImage(src, filename) {
+  const link = document.createElement("a");
+  link.href = src;
+  link.download = filename;
+  link.click();
+}
+
+function openLightbox(src, caption) {
+  lightboxImg.src = src;
+  lightboxCaption.textContent = caption;
+  lightbox.classList.remove("hidden");
+}
+
+function closeLightbox() { lightbox.classList.add("hidden"); }
+
+document.getElementById("lightbox-close").addEventListener("click", closeLightbox);
+lightboxImg.addEventListener("click", closeLightbox);
+lightbox.addEventListener("click", event => {
+  if (event.target === lightbox) closeLightbox();
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeLightbox();
+});
+document.getElementById("lightbox-download").addEventListener("click", () =>
+  downloadImage(lightboxImg.src, (lightboxCaption.textContent || "image")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "_") + ".png"));
+
+// Clicking any result image opens it, delegated so comparison panels work too
+document.getElementById("results").addEventListener("click", event => {
+  if (event.target.tagName === "IMG") {
+    const caption = event.target.closest(".panel").querySelector("h3").textContent;
+    openLightbox(event.target.src, caption);
+  }
+  const target = event.target.dataset ? event.target.dataset.download : null;
+  if (target) {
+    const image = document.getElementById(target);
+    downloadImage(image.src, target + ".png");
+  }
+});
+
+loadModels();
+</script>
+</body>
+</html>

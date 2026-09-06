@@ -725,4 +725,26 @@ xai-chest-radiology/
 │       ├── rsna_train.csv
 │       └── rsna_val.csv
 ├── sota/
-└── README.md
+│   ├── Choix_base_de_donnees_CXR.xlsx
+│   └── SOTA_Table_XAI_Multimodal_Radiologie (1) (1).xlsx
+├── xai-radiology-app/
+│   ├── app/
+│       ├── backend/
+│       │   ├── __pycache__/
+│       │   │   ├── config.cpython-312.pyc
+│       │   │   ├── inference.cpython-312.pyc
+│       │   │   └── main.cpython-312.pyc
+│       │   ├── models/
+│       │   │   ├── README.md
+│       │   │   ├── densenet121_covid_best.pth
+│       │   │   └── densenet121_rsna_best.pth
+│       │   ├── static/
+│       │   │   └── index.html
+│       │   ├── config.py
+│       │   ├── inference.py
+│       │   ├── main.py
+│       │   └── requirements.txt
+│       ├── Dockerfile
+│       └── README.md
+├── README.md
+└── directory-tree.txt
