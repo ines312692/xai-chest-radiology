@@ -1,0 +1,7 @@
+{
+  "accuracy": 0.9521,
+  "macro_precision": 0.966,
+  "macro_recall": 0.9421,
+  "macro_f1": 0.9534,
+  "macro_auc_ovr": 0.9945
+}
