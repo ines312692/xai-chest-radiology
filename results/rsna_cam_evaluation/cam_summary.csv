@@ -1,0 +1,6 @@
+method,iou,hit,deletion_auc,insertion_auc,faithfulness
+scorecam,0.2853,0.72,0.7258,0.9811,0.2554
+gradcam,0.2683,0.7,0.6874,0.9876,0.3002
+gradcampp,0.2671,0.74,0.7001,0.9855,0.2855
+layercam,0.266,0.74,0.7057,0.9844,0.2787
+eigencam,0.231,0.72,0.7637,0.9775,0.2138
