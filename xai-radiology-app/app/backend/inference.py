@@ -4,6 +4,15 @@ The module exposes one entry point, analyze_image, which runs the three stages o
 pipeline for a chosen model: classification, visual explanation with Grad-CAM, and
 textual explanation.
 
+The textual stage is tried in three steps, in this order. The remote report server is the
+normal path, a Kaggle session holding MedGemma on a GPU behind a public tunnel. A local
+MedGemma is used when the machine running this service has a GPU and the local mode was
+enabled. The structured writer is the deterministic fallback, so a demonstration never
+fails because a tunnel closed.
+
+What travels to the report server is the clean radiograph and the facts extracted here,
+the predicted class, its confidence and the anatomical zone of strongest activation. The
+saliency overlay never travels, following the conditioning results of the project.
 """
 import base64
 import io
@@ -12,14 +21,16 @@ import os
 from functools import lru_cache
 
 import numpy as np
+import requests
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image
 from torchvision import models as tv_models
 
-from config import (ENABLE_VLM, IMAGENET_MEAN, IMAGENET_STD, IMG_SIZE, MODELS,
-                    VLM_MODEL_ID)
+from config import (ENABLE_LOCAL_VLM, IMAGENET_MEAN, IMAGENET_STD, IMG_SIZE, MODELS,
+                    REMOTE_VLM_MAX_SIDE, REMOTE_VLM_TIMEOUT, VLM_MODEL_ID,
+                    remote_vlm_secret, remote_vlm_url)
 
 logger = logging.getLogger(__name__)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,14 +93,14 @@ def load_classifier(model_id):
 
 @lru_cache(maxsize=1)
 def load_vlm():
-    """Load the Vision Language Model, quantized when a GPU is available.
+    """Load a local Vision Language Model, quantized when a GPU is available.
 
-    Returns None when the model is disabled or cannot be loaded, in which case the
-    service falls back to the structured writer instead of failing. MedGemma is gated on
-    Hugging Face, so a token must be available in the environment for it to load.
+    Returns None when the local mode is disabled or the model cannot be loaded, in which
+    case the service relies on the remote report server or on the structured writer
+    rather than failing. MedGemma is gated on Hugging Face, so a token must be available
+    in the environment for it to load.
     """
-    if not ENABLE_VLM:
-        logger.warning("VLM disabled by configuration, using the structured writer")
+    if not ENABLE_LOCAL_VLM:
         return None
     try:
         from transformers import (AutoProcessor, AutoModelForImageTextToText,
@@ -101,10 +112,10 @@ def load_vlm():
         processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
         model = AutoModelForImageTextToText.from_pretrained(VLM_MODEL_ID, **kwargs)
         model.eval()
-        logger.info("VLM loaded: %s", VLM_MODEL_ID)
+        logger.info("Local VLM loaded: %s", VLM_MODEL_ID)
         return processor, model
     except Exception as exc:
-        logger.warning("VLM unavailable (%s), using the structured writer", exc)
+        logger.warning("Local VLM unavailable (%s)", exc)
         return None
 
 
@@ -173,9 +184,10 @@ def _build_prompt(label, confidence, zone):
 
     The explanation travels as language, never as pixels, and the instruction forbids
     meta commentary, which was the contamination observed when the model was free to
-    discuss the overlay.
+    discuss the overlay. The same wording is used by the remote server, so a report is
+    identical whichever side generates it.
     """
-    readable = label.replace("_", " ").lower()
+    readable = str(label).replace("_", " ").lower()
     return (f"A diagnostic model classifies this chest radiograph as {readable} with "
             f"{confidence:.0%} confidence, and its attention is concentrated on the "
             f"{zone}. Examine that region and write the findings section of a radiology "
@@ -185,15 +197,110 @@ def _build_prompt(label, confidence, zone):
             f"model, heatmap, colours or confidence value.")
 
 
+LIMITATION_SECTION = ("■ LIMITATIONS — This system reports pneumonia only and "
+                      "does not exclude other pathology. It is a research prototype, not "
+                      "a medical device, and every output requires review by a qualified "
+                      "radiologist.")
+
+
+def _wrap_vlm_report(text):
+    """Give the generated paragraph the same section markers as the structured writer.
+
+    The model returns a findings paragraph, so the marker is added here rather than asked
+    for in the prompt, which keeps the prompt identical to the one that was evaluated.
+    The limitation section is appended because it must appear whoever wrote the report.
+    """
+    body = text.strip()
+    if not body.startswith("■"):
+        body = f"■ FINDINGS — {body}"
+    return f"{body}\n\n{LIMITATION_SECTION}"
+
+
+def _encode_for_remote(image):
+    """Downscale and encode the clean radiograph as a base64 png for the report server."""
+    picture = image.convert("RGB")
+    longest = max(picture.size)
+    if longest > REMOTE_VLM_MAX_SIDE:
+        scale = REMOTE_VLM_MAX_SIDE / longest
+        picture = picture.resize((max(1, int(picture.width * scale)),
+                                  max(1, int(picture.height * scale))),
+                                 Image.LANCZOS)
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def remote_status():
+    """Ask the report server whether it is alive, for the health and settings endpoints.
+
+    The call is short and never raises, because the interface polls it while the user is
+    pasting a new tunnel address and a closed tunnel is an ordinary situation here.
+    """
+    url = remote_vlm_url()
+    if not url:
+        return {"configured": False, "reachable": False, "url": None,
+                "detail": "No report server configured, the structured writer is used."}
+    try:
+        response = requests.get(f"{url}/health", timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        return {"configured": True, "reachable": True, "url": url,
+                "model": payload.get("model"), "device": payload.get("device"),
+                "detail": "Report server reachable."}
+    except Exception as exc:
+        return {"configured": True, "reachable": False, "url": url,
+                "detail": f"Report server unreachable: {exc}"}
+
+
+def remote_report(image, label, confidence, zone):
+    """Ask the Kaggle report server for the findings, raising when it cannot answer."""
+    url = remote_vlm_url()
+    if not url:
+        raise RuntimeError("no report server configured")
+    response = requests.post(
+        f"{url}/report",
+        json={"image_b64": _encode_for_remote(image), "label": label,
+              "confidence": float(confidence), "zone": zone},
+        headers={"X-Auth": remote_vlm_secret()},
+        timeout=REMOTE_VLM_TIMEOUT)
+    if response.status_code == 401:
+        raise RuntimeError("the shared secret of the service and of the notebook differ")
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("report"):
+        raise RuntimeError(payload.get("error", "the server returned no report"))
+    return payload["report"]
+
+
+def local_report(image, label, confidence, zone):
+    """Generate the findings with a MedGemma loaded in this process."""
+    processor, model = load_vlm()
+    messages = [
+        {"role": "system",
+         "content": [{"type": "text", "text": "You are an expert radiologist."}]},
+        {"role": "user",
+         "content": [{"type": "image", "image": image.convert("RGB")},
+                     {"type": "text",
+                      "text": _build_prompt(label, confidence, zone)}]},
+    ]
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt").to(model.device)
+    length = inputs["input_ids"].shape[-1]
+    with torch.inference_mode():
+        output = model.generate(**inputs, max_new_tokens=220, do_sample=False)
+    return processor.decode(output[0][length:], skip_special_tokens=True).strip()
+
+
 def _structured_report(label, confidence, zone, distribution):
-    """Deterministic writer used when the Vision Language Model is not available.
+    """Deterministic writer used when no Vision Language Model can be reached.
 
     Sections are separated by a visible marker rather than by a newline alone, because a
     line break depends on how the client renders the field while a marker survives any
     rendering. The degraded mode stays explicit to the caller through the generator field
     of the response.
     """
-    is_normal = label.upper() == "NORMAL"
+    is_normal = str(label).upper() == "NORMAL"
     runner_up = min(p["probability"] for p in distribution)
 
     if is_normal:
@@ -210,40 +317,45 @@ def _structured_report(label, confidence, zone, distribution):
                       f"confidence.")
 
     sections = [
-        f"\u25a0 FINDINGS \u2014 {findings} Cardiac silhouette, mediastinal contours and "
+        f"■ FINDINGS — {findings} Cardiac silhouette, mediastinal contours and "
         f"pleural spaces are not assessed by this system and require review on the "
         f"original study.",
-        f"\u25a0 IMPRESSION \u2014 {impression} The alternative class was scored at "
+        f"■ IMPRESSION — {impression} The alternative class was scored at "
         f"{runner_up:.0%}.",
-        f"\u25a0 LIMITATIONS \u2014 This system reports pneumonia only and does not "
-        f"exclude other pathology. It is a research prototype, not a medical device, and "
-        f"every output requires review by a qualified radiologist.",
+        LIMITATION_SECTION,
     ]
     return "\n\n".join(sections)
 
 
 def generate_text(image, label, confidence, zone, distribution):
-    """Produce the textual explanation, with the structured writer as fallback."""
-    loaded = load_vlm()
-    if loaded is None:
-        return _structured_report(label, confidence, zone, distribution), "structured"
+    """Produce the textual explanation and say which writer produced it.
 
-    processor, model = loaded
-    messages = [
-        {"role": "system",
-         "content": [{"type": "text", "text": "You are an expert radiologist."}]},
-        {"role": "user",
-         "content": [{"type": "image", "image": image.convert("RGB")},
-                     {"type": "text",
-                      "text": _build_prompt(label, confidence, zone)}]},
-    ]
-    inputs = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True,
-        return_dict=True, return_tensors="pt").to(model.device)
-    length = inputs["input_ids"].shape[-1]
-    with torch.inference_mode():
-        output = model.generate(**inputs, max_new_tokens=220, do_sample=False)
-    return processor.decode(output[0][length:], skip_special_tokens=True).strip(), "vlm"
+    Returns the report, the identifier of the writer, and a warning when a Vision
+    Language Model was expected but could not answer, so the interface can tell the user
+    that the report on screen comes from the fallback.
+    """
+    warning = None
+
+    if remote_vlm_url():
+        try:
+            return _wrap_vlm_report(
+                remote_report(image, label, confidence, zone)), "vlm_remote", None
+        except Exception as exc:
+            warning = (f"The report server did not answer ({exc}), so the structured "
+                       f"writer produced the text below.")
+            logger.warning("Remote report failed: %s", exc)
+
+    if load_vlm() is not None:
+        try:
+            return _wrap_vlm_report(
+                local_report(image, label, confidence, zone)), "vlm_local", warning
+        except Exception as exc:
+            warning = (f"The local model failed ({exc}), so the structured writer "
+                       f"produced the text below.")
+            logger.warning("Local report failed: %s", exc)
+
+    return (_structured_report(label, confidence, zone, distribution),
+            "structured", warning)
 
 
 def analyze_image(image, model_id, with_text=True):
@@ -257,9 +369,10 @@ def analyze_image(image, model_id, with_text=True):
     (label, confidence, overlay, zone, distribution,
      cam_label) = classify_and_localize(image, model_id)
     if with_text:
-        text, generator = generate_text(image, label, confidence, zone, distribution)
+        text, generator, warning = generate_text(image, label, confidence, zone,
+                                                 distribution)
     else:
-        text, generator = None, None
+        text, generator, warning = None, None, None
     return {
         "model_id": model_id,
         "model_name": spec["name"],
@@ -271,6 +384,7 @@ def analyze_image(image, model_id, with_text=True):
         "cam_label": cam_label,
         "explanation_text": text,
         "generator": generator,
+        "generator_warning": warning,
         "heatmap_png_base64": _overlay_to_base64(overlay),
         "disclaimer": ("Research prototype produced for a Master thesis. "
                        "Not a medical device. Not for clinical use."),

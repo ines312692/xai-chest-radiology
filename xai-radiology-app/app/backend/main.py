@@ -3,6 +3,8 @@
 Endpoints:
   GET  /health   readiness and runtime information
   GET  /models   the classifiers the service can serve and their availability
+  GET  /vlm      state of the remote report server, the Kaggle session holding MedGemma
+  POST /vlm      register the tunnel address printed by that notebook
   POST /analyze  multipart upload, analysed by one model, or by every model at once
   GET  /         the single page frontend
 """
@@ -13,9 +15,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel
 
-from config import DEFAULT_MODEL, ENABLE_VLM, MAX_UPLOAD_MB, MODELS, VLM_MODEL_ID
-from inference import DEVICE, analyze_image, available_models, load_classifier
+from config import (DEFAULT_MODEL, ENABLE_LOCAL_VLM, MAX_UPLOAD_MB, MODELS, VLM_MODEL_ID,
+                    save_remote_vlm)
+from inference import (DEVICE, analyze_image, available_models, load_classifier,
+                       remote_status)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,11 +30,17 @@ app = FastAPI(
     description=("Classification, Grad-CAM visual explanation and text conditioned "
                  "VLM explanation for chest radiographs, served by several trained "
                  "models. Research prototype."),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
+
+
+class VlmSettings(BaseModel):
+    """Address of the report server, and optionally the shared secret guarding it."""
+    url: str
+    secret: str | None = None
 
 
 @app.on_event("startup")
@@ -44,18 +55,43 @@ def warm_up():
         else:
             logger.warning("Checkpoint missing for model %s, it will be offered as "
                            "unavailable", entry["id"])
+    state = remote_status()
+    logger.info("Report server: %s", state["detail"])
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "device": DEVICE.type, "default_model": DEFAULT_MODEL,
-            "vlm_enabled": ENABLE_VLM, "vlm_model": VLM_MODEL_ID}
+            "local_vlm_enabled": ENABLE_LOCAL_VLM, "vlm_model": VLM_MODEL_ID,
+            "remote_vlm": remote_status()}
 
 
 @app.get("/models")
 def models():
     """List the classifiers, so the interface can build its model selector."""
     return {"models": available_models(), "default": DEFAULT_MODEL}
+
+
+@app.get("/vlm")
+def vlm():
+    """Report whether the Kaggle report server is configured and answering."""
+    return remote_status()
+
+
+@app.post("/vlm")
+def set_vlm(settings: VlmSettings):
+    """Register the tunnel address printed by the notebook, then probe it.
+
+    The address changes at every restart of the Kaggle session, so it is entered from the
+    interface rather than edited in the source. An empty address clears the setting and
+    sends the service back to the structured writer.
+    """
+    url = settings.url.strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400,
+                            detail="The address must start with http:// or https://")
+    save_remote_vlm(url, settings.secret)
+    return remote_status()
 
 
 @app.post("/analyze")

@@ -316,6 +316,22 @@
   .sheet .imgbox > div { max-width: 100%; }
   .sheet .box:has(.imgbox) { max-width: min(1040px, 94vw); }
 
+  /* ---------- report server indicator and its settings sheet ---------- */
+  #vlm-btn.up   { color: #35916a; }
+  #vlm-btn.down { color: var(--flag-pos); }
+  .field { display: grid; gap: 5px; margin-bottom: 14px; }
+  .field label {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .11em; color: var(--ink-3);
+  }
+  .field input {
+    background: var(--surface-2); border: 1px solid var(--line); color: var(--ink);
+    border-radius: var(--r-s); padding: 8px 11px; font-size: 12.5px; width: 100%;
+  }
+  .field input:focus { border-color: var(--accent); outline: none; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .hint { font-size: 12px; color: var(--ink-3); line-height: 1.5; }
+
   /* ------------------------- narrow ------------------------- */
   @media (max-width: 1080px) {
     main { height: auto; padding-bottom: 36px; }
@@ -349,6 +365,15 @@
     <button class="icon-btn bare tip" id="theme" data-tip="Dark mode" aria-label="Toggle dark mode">
       <svg id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
            stroke-linecap="round" stroke-linejoin="round"></svg>
+    </button>
+    <button class="icon-btn bare tip" id="vlm-btn" data-tip="Report server"
+            aria-label="Report server">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+           stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3.5" y="4" width="17" height="6" rx="1.6"/>
+        <rect x="3.5" y="14" width="17" height="6" rx="1.6"/>
+        <path d="M7 7h.01M7 17h.01"/>
+      </svg>
     </button>
     <button class="icon-btn bare tip" id="about" data-tip="About" aria-label="About">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
@@ -477,6 +502,7 @@
         </div>
 
         <p class="warnbox hide" id="warn"></p>
+        <p class="warnbox hide" id="genwarn"></p>
         <p class="errbox" id="err"></p>
       </div>
     </section>
@@ -653,8 +679,11 @@ function render(data) {
   el("v-pct").textContent   = Math.round(data.confidence * 100) + "%";
   el("v-zone").textContent  = data.peak_zone;
   el("v-model").textContent = data.model_name;
-  el("v-gen").textContent =
-    data.generator === "vlm" ? "Vision language model" : "Structured writer";
+  el("v-gen").textContent = GENERATOR_LABEL[data.generator] || "Structured writer";
+  if (data.generator_warning) {
+    el("genwarn").textContent = data.generator_warning;
+    el("genwarn").classList.remove("hide");
+  } else el("genwarn").classList.add("hide");
   el("panel-model").textContent = data.model_name;
   el("tag-model").textContent = data.model_name;
 
@@ -734,7 +763,8 @@ el("clear").onclick = () => {
   el("canvas").classList.add("hide"); el("drop").classList.remove("hide");
   el("stage").classList.add("blank");
   el("result").classList.add("hide"); el("empty").classList.remove("hide");
-  el("warn").classList.add("hide"); el("err").textContent = "";
+  el("warn").classList.add("hide"); el("genwarn").classList.add("hide");
+  el("err").textContent = "";
   el("filename").textContent = ""; el("panel-model").textContent = "";
   el("tag-model").textContent = ""; el("tag-view").textContent = "";
   el("opacity-row").classList.add("hide");
@@ -781,7 +811,98 @@ el("canvas").onclick = () => {
     + "</div></div>");
 };
 
+/* ---------- report server ---------- */
+const GENERATOR_LABEL = {
+  vlm_remote: "MedGemma, remote GPU",
+  vlm_local:  "MedGemma, local GPU",
+  structured: "Structured writer",
+};
+
+let vlmState = null;
+
+async function refreshVlm() {
+  try {
+    vlmState = await (await fetch(API_BASE + "/vlm")).json();
+  } catch (e) {
+    vlmState = { configured: false, reachable: false,
+                 detail: "The local service did not answer." };
+  }
+  const button = el("vlm-btn");
+  button.classList.toggle("up", !!vlmState.reachable);
+  button.classList.toggle("down", !!vlmState.configured && !vlmState.reachable);
+  button.dataset.tip = vlmState.reachable ? "Report server connected"
+    : vlmState.configured ? "Report server unreachable" : "Report server not configured";
+}
+
+function vlmSheet() {
+  const state = vlmState || {};
+  sheet("<h2>Report server</h2>"
+    + "<p>MedGemma writes the report in a Kaggle session with a GPU. Paste here the "
+    + "address the notebook prints when the tunnel opens. That address changes every "
+    + "time the notebook is restarted, and the report falls back to the structured "
+    + "writer whenever the server cannot be reached.</p>"
+    + "<div class='field'><label for='vlm-url'>Tunnel address</label>"
+    + "<input id='vlm-url' type='text' spellcheck='false' autocomplete='off' "
+    + "placeholder='https://xxxx.trycloudflare.com' value='" + (state.url || "") + "'></div>"
+    + "<div class='field'><label for='vlm-secret'>Shared secret</label>"
+    + "<input id='vlm-secret' type='text' spellcheck='false' autocomplete='off' "
+    + "placeholder='leave empty to keep the current one'></div>"
+    + "<div class='row'><button class='ghost-btn' id='vlm-paste'>Paste address</button>"
+    + "<button class='ghost-btn' id='vlm-save'>Save and test</button>"
+    + "<span class='hint' id='vlm-detail'>" + (state.detail || "") + "</span></div>");
+  el("vlm-save").onclick = saveVlm;
+  el("vlm-paste").onclick = pasteVlm;
+  // The field is focused and its content selected, so the keyboard shortcut of the
+  // browser lands in it and a new address replaces the old one in one gesture
+  el("vlm-url").focus();
+  el("vlm-url").select();
+  el("vlm-url").onkeydown = e => { if (e.key === "Enter") saveVlm(); };
+  el("vlm-secret").onkeydown = e => { if (e.key === "Enter") saveVlm(); };
+}
+
+async function pasteVlm() {
+  /* Read the clipboard for the user, since the keyboard shortcut sometimes lands
+     outside the field depending on how the window took the focus. */
+  try {
+    const text = (await navigator.clipboard.readText() || "").trim();
+    if (!text) {
+      el("vlm-detail").textContent = "The clipboard is empty, copy the address printed "
+        + "by the notebook first.";
+      return;
+    }
+    el("vlm-url").value = text;
+    el("vlm-detail").textContent = "Address pasted, click Save and test.";
+  } catch (e) {
+    el("vlm-detail").textContent = "The browser refused access to the clipboard, so type "
+      + "the address by hand.";
+  }
+}
+
+async function saveVlm() {
+  el("vlm-detail").textContent = "Testing the address";
+  const body = { url: el("vlm-url").value.trim() };
+  const secret = el("vlm-secret").value.trim();
+  if (secret) body.secret = secret;
+  try {
+    const response = await fetch(API_BASE + "/vlm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "request failed");
+    vlmState = data;
+    el("vlm-detail").textContent = data.detail;
+    refreshVlm();
+  } catch (e) {
+    el("vlm-detail").textContent = "Could not save: " + e.message;
+  }
+}
+
+el("vlm-btn").onclick = vlmSheet;
+
 loadModels();
+refreshVlm();
+setInterval(refreshVlm, 60000);
 </script>
 </body>
 </html>
