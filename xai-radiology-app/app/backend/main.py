@@ -17,10 +17,11 @@ from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 
-from config import (DEFAULT_MODEL, ENABLE_LOCAL_VLM, MAX_UPLOAD_MB, MODELS, VLM_MODEL_ID,
+from config import (CAM_METHODS, CAM_METRICS_SOURCE, DEFAULT_CAM_METHOD, DEFAULT_MODEL,
+                    ENABLE_LOCAL_VLM, MAX_UPLOAD_MB, MODELS, VLM_MODEL_ID,
                     save_remote_vlm)
-from inference import (DEVICE, analyze_image, available_models, load_classifier,
-                       remote_status)
+from inference import (DEVICE, analyze_image, available_cam_methods, available_models,
+                       comparable_cam_methods, load_classifier, remote_status)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,6 +73,13 @@ def models():
     return {"models": available_models(), "default": DEFAULT_MODEL}
 
 
+@app.get("/cams")
+def cams():
+    """List the saliency methods and their benchmark scores, for the method selector."""
+    return {"methods": available_cam_methods(), "default": DEFAULT_CAM_METHOD,
+            "metrics_source": CAM_METRICS_SOURCE}
+
+
 @app.get("/vlm")
 def vlm():
     """Report whether the Kaggle report server is configured and answering."""
@@ -97,12 +105,16 @@ def set_vlm(settings: VlmSettings):
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...),
                   model_id: str = Form(DEFAULT_MODEL),
-                  compare: bool = Form(False)):
+                  cam_method: str = Form(DEFAULT_CAM_METHOD),
+                  compare: str = Form("none")):
     """Analyse one uploaded chest radiograph.
 
-    With compare set, every available model analyses the same image, the selected one
-    producing the textual explanation and the others only their heatmap, so the user
-    can see how the visual explanation depends on what each model learned to detect.
+    Three comparison modes. With none, one model and one saliency method. With
+    backbones, every available model analyses the same image with the chosen method,
+    the selected one producing the textual explanation and the others only their
+    heatmap, so the user sees how the visual explanation depends on what each model
+    learned to detect. With methods, one model produces one map per fast saliency
+    method, which shows how much of the explanation is the method rather than the model.
     """
     payload = await file.read()
     if len(payload) > MAX_UPLOAD_MB * 1024 * 1024:
@@ -110,6 +122,16 @@ async def analyze(file: UploadFile = File(...),
                             detail=f"File larger than {MAX_UPLOAD_MB} MB")
     if model_id not in MODELS:
         raise HTTPException(status_code=400, detail=f"Unknown model {model_id}")
+    if cam_method not in CAM_METHODS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown saliency method {cam_method}")
+
+    # The checkbox of the previous interface sent a boolean, which is still accepted
+    mode = {"true": "backbones", "false": "none", "": "none"}.get(
+        compare.strip().lower(), compare.strip().lower())
+    if mode not in ("none", "backbones", "methods"):
+        raise HTTPException(status_code=400, detail=f"Unknown comparison mode {compare}")
+    extra_methods = comparable_cam_methods(cam_method) if mode == "methods" else ()
 
     try:
         image = Image.open(io.BytesIO(payload))
@@ -119,12 +141,14 @@ async def analyze(file: UploadFile = File(...),
                             detail="Unsupported image format, send png or jpeg")
 
     try:
-        primary = analyze_image(image, model_id, with_text=True)
+        primary = analyze_image(image, model_id, with_text=True, cam_method=cam_method,
+                                extra_cam_methods=extra_methods)
         others = []
-        if compare:
+        if mode == "backbones":
             for entry in available_models():
                 if entry["available"] and entry["id"] != model_id:
-                    others.append(analyze_image(image, entry["id"], with_text=False))
+                    others.append(analyze_image(image, entry["id"], with_text=False,
+                                                cam_method=cam_method))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=f"Model checkpoint missing: {exc}")
     except Exception as exc:

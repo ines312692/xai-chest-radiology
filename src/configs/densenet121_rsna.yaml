@@ -1,0 +1,30 @@
+# DenseNet121 on the RSNA Pneumonia Detection Challenge.
+#
+# The reference backbone of chest radiography since CheXNet, and the classifier of the
+# Nature Machine Intelligence 2022 saliency benchmark. Every field except the backbone
+# is identical to resnet50_rsna.yaml, which is what makes the comparison controlled:
+# same seed, same split, same optimisation, one difference.
+#
+# Point output_dir to the same folder as the ResNet run to reuse its frozen split, or
+# run preprocess.py again here, which produces the same partition since the seed and
+# the proportions are identical.
+
+name: densenet121_rsna
+seed: 42
+output_dir: outputs/densenet121_rsna
+
+data:
+  root: null
+  batch_size: 32
+  num_workers: 2
+
+model:
+  architecture: densenet121
+  pretrained: true
+  learning_rate: 0.0001
+  epochs: 50
+  patience: 8
+
+explain:
+  methods: [gradcam, gradcampp, eigencam, layercam, scorecam]
+  localization_samples: 50

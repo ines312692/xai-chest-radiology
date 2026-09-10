@@ -1,0 +1,29 @@
+# ResNet50 on the RSNA Pneumonia Detection Challenge.
+#
+# The baseline of the MDPI Information 2025 paper of the state of the art table, which
+# reports accuracy 0.90 and AUC 0.93 with this backbone, so our numbers are directly
+# comparable to a published reference.
+#
+# Only the fields that differ from the defaults of xai_chest/config.py appear here.
+
+name: resnet50_rsna
+seed: 42
+output_dir: outputs/resnet50_rsna
+
+data:
+  # Left empty on Kaggle, where the mount name changes between sessions and the folder
+  # is resolved by searching for stage_2_train_labels.csv
+  root: null
+  batch_size: 32
+  num_workers: 2
+
+model:
+  architecture: resnet50
+  pretrained: true
+  learning_rate: 0.0001
+  epochs: 50
+  patience: 8
+
+explain:
+  methods: [gradcam, gradcampp, eigencam, layercam, scorecam]
+  localization_samples: 50

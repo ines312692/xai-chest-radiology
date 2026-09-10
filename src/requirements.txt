@@ -1,0 +1,15 @@
+# Runtime dependencies of the package. Versions are lower bounds, since the code runs
+# both on a Kaggle image that pins its own versions and on a local machine.
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+matplotlib>=3.7
+pydicom>=2.4
+Pillow>=10.0
+PyYAML>=6.0
+grad-cam>=1.5
+
+# Development only
+pytest>=7.4

@@ -331,6 +331,8 @@
   .field input:focus { border-color: var(--accent); outline: none; }
   .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
   .hint { font-size: 12px; color: var(--ink-3); line-height: 1.5; }
+  .select-wrap.narrow select { min-width: 152px; }
+  .block .hint { margin-top: 10px; max-width: 62ch; }
 
   /* ------------------------- narrow ------------------------- */
   @media (max-width: 1080px) {
@@ -361,7 +363,16 @@
     </div>
     <span class="grow"></span>
     <div class="select-wrap"><select id="model-select" aria-label="Model"></select></div>
-    <label class="check"><input type="checkbox" id="compare"> <span>Compare backbones</span></label>
+    <div class="select-wrap narrow">
+      <select id="cam-select" aria-label="Saliency method"></select>
+    </div>
+    <div class="select-wrap narrow">
+      <select id="compare-select" aria-label="Comparison">
+        <option value="none">No comparison</option>
+        <option value="backbones">Compare backbones</option>
+        <option value="methods">Compare saliency</option>
+      </select>
+    </div>
     <button class="icon-btn bare tip" id="theme" data-tip="Dark mode" aria-label="Toggle dark mode">
       <svg id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
            stroke-linecap="round" stroke-linejoin="round"></svg>
@@ -479,6 +490,7 @@
             <dl class="meta">
               <div><dt>Region</dt><dd id="v-zone"></dd></div>
               <div><dt>Model</dt><dd id="v-model"></dd></div>
+              <div><dt>Saliency</dt><dd id="v-cam"></dd></div>
               <div><dt>Report by</dt><dd id="v-gen"></dd></div>
             </dl>
           </div>
@@ -488,13 +500,19 @@
             <div id="scores"></div>
           </div>
 
+          <div class="block hide" id="cam-block">
+            <p class="eyebrow">Saliency benchmark</p>
+            <dl class="meta" id="cam-metrics"></dl>
+            <p class="hint" id="cam-source"></p>
+          </div>
+
           <div class="block">
             <p class="eyebrow">Report</p>
             <div id="report"></div>
           </div>
 
           <div class="block hide" id="twin-block">
-            <p class="eyebrow">Backbone comparison</p>
+            <p class="eyebrow" id="twin-title">Backbone comparison</p>
             <div class="twin" id="twin"></div>
           </div>
 
@@ -517,6 +535,7 @@
 const API_BASE = "";
 const el = id => document.getElementById(id);
 let file = null, models = [], activeModel = null, viewMode = "plain";
+let camMethods = [], activeCam = "gradcam";
 
 /* ---------- theme ---------- */
 const SUN = '<circle cx="12" cy="12" r="4"/><path d="M12 2.8v2M12 19.2v2M4.8 12H2.8M21.2 12h-2'
@@ -562,11 +581,34 @@ async function loadModels() {
     select.onchange = () => { activeModel = select.value; if (file) analyse(); };
     el("status").classList.add("up");
     el("status").querySelector("span").textContent = "Service ready";
-    el("compare").parentElement.style.display =
-      models.filter(m => m.available).length > 1 ? "flex" : "none";
+    // The backbone comparison needs at least two checkpoints on disk
+    el("compare-select").querySelector("option[value=backbones]").disabled =
+      models.filter(m => m.available).length < 2;
   } catch (err) {
     el("status").classList.add("down");
     el("status").querySelector("span").textContent = "Service offline";
+  }
+}
+
+/* ---------- saliency methods ---------- */
+async function loadCams() {
+  try {
+    const data = await (await fetch(API_BASE + "/cams")).json();
+    camMethods = data.methods;
+    activeCam = data.default;
+    const select = el("cam-select");
+    select.innerHTML = "";
+    camMethods.forEach(m => {
+      const option = document.createElement("option");
+      option.value = m.id;
+      option.textContent = m.name + (m.fast ? "" : "  (slow)");
+      option.selected = m.id === activeCam;
+      option.title = m.description;
+      select.appendChild(option);
+    });
+    select.onchange = () => { activeCam = select.value; if (file) analyse(); };
+  } catch (err) {
+    el("cam-select").innerHTML = "<option>Grad-CAM</option>";
   }
 }
 
@@ -647,15 +689,19 @@ function checkColour(dataUrl) {
 /* ---------- analysis ---------- */
 async function analyse() {
   if (!file || !activeModel) return;
-  el("busy-text").textContent = el("compare").checked
-    ? "Analysing with both backbones" : "Analysing";
+  const mode = el("compare-select").value;
+  el("busy-text").textContent =
+    mode === "backbones" ? "Analysing with every backbone"
+    : mode === "methods" ? "Computing every saliency method"
+    : "Analysing";
   el("busy").classList.remove("hide");
   el("err").textContent = "";
 
   const form = new FormData();
   form.append("file", file);
   form.append("model_id", activeModel);
-  form.append("compare", el("compare").checked ? "true" : "false");
+  form.append("cam_method", activeCam);
+  form.append("compare", mode);
 
   try {
     const response = await fetch(API_BASE + "/analyze", { method: "POST", body: form });
@@ -679,6 +725,9 @@ function render(data) {
   el("v-pct").textContent   = Math.round(data.confidence * 100) + "%";
   el("v-zone").textContent  = data.peak_zone;
   el("v-model").textContent = data.model_name;
+  el("v-cam").textContent   = data.cam_method_name || "Grad-CAM";
+  el("tab-cam").textContent = data.cam_method_name || "Grad-CAM";
+  renderCamMetrics(data);
   el("v-gen").textContent = GENERATOR_LABEL[data.generator] || "Structured writer";
   if (data.generator_warning) {
     el("genwarn").textContent = data.generator_warning;
@@ -708,12 +757,31 @@ function render(data) {
            + "<p>" + body + "</p></div>";
   }).join("");
 
+  // One grid, two possible contents: the same method across backbones, or the same
+  // backbone across methods. The prediction is repeated only in the first case, since
+  // in the second it is identical by construction.
   if (data.comparisons && data.comparisons.length) {
+    el("twin-title").textContent = "Backbone comparison";
     el("twin").innerHTML = [data, ...data.comparisons].map(entry =>
       "<figure><img src='data:image/png;base64," + entry.heatmap_png_base64 + "' alt='"
       + entry.model_name + "'><figcaption><strong>" + entry.model_name + "</strong><br>"
       + entry.label.replace("_", " ") + ", " + Math.round(entry.confidence * 100) + "%<br>"
       + entry.peak_zone + "</figcaption></figure>").join("");
+    el("twin-block").classList.remove("hide");
+  } else if (data.cam_variants && data.cam_variants.length) {
+    el("twin-title").textContent = "Saliency comparison, " + data.model_name;
+    const entries = [{ cam_method_name: data.cam_method_name,
+                       peak_zone: data.peak_zone, metrics: data.cam_metrics,
+                       heatmap_png_base64: data.heatmap_png_base64 },
+                     ...data.cam_variants];
+    el("twin").innerHTML = entries.map(entry =>
+      "<figure><img src='data:image/png;base64," + entry.heatmap_png_base64 + "' alt='"
+      + entry.cam_method_name + "'><figcaption><strong>" + entry.cam_method_name
+      + "</strong><br>" + entry.peak_zone
+      + (entry.metrics && entry.metrics.miou
+          ? "<br>mIoU " + entry.metrics.miou.toFixed(3)
+            + ", hit rate " + entry.metrics.hit_rate.toFixed(2) : "")
+      + "</figcaption></figure>").join("");
     el("twin-block").classList.remove("hide");
   } else el("twin-block").classList.add("hide");
 
@@ -726,6 +794,28 @@ function render(data) {
     .forEach(id => el(id).disabled = false);
   el("opacity-row").classList.remove("hide");
   setView("overlay");
+}
+
+/* ---------- saliency benchmark ----------
+   The scores are those of the project evaluation notebook, not a measurement on the
+   study on screen. They are shown next to the map so the reader knows how much trust
+   the chosen method earned, and the label states which direction is better. */
+const CAM_METRIC_ROWS = [
+  ["miou",      "mIoU",                       v => v.toFixed(4)],
+  ["hit_rate",  "Hit rate",                   v => v.toFixed(2)],
+  ["deletion",  "Deletion, lower is better",  v => v.toFixed(4)],
+  ["insertion", "Insertion, higher is better", v => v.toFixed(4)],
+  ["gap",       "Insertion minus deletion",   v => v.toFixed(4)],
+];
+
+function renderCamMetrics(data) {
+  const metrics = data.cam_metrics || {};
+  const rows = CAM_METRIC_ROWS.filter(r => typeof metrics[r[0]] === "number");
+  if (!rows.length) { el("cam-block").classList.add("hide"); return; }
+  el("cam-metrics").innerHTML = rows.map(([key, label, format]) =>
+    "<div><dt>" + label + "</dt><dd>" + format(metrics[key]) + "</dd></div>").join("");
+  el("cam-source").textContent = data.cam_metrics_source || "";
+  el("cam-block").classList.remove("hide");
 }
 
 /* ---------- viewer modes ---------- */
@@ -741,7 +831,8 @@ function setView(mode) {
   // disappearing and leaving an empty band at the foot of the panel
   el("opacity-row").classList.toggle("off", mode !== "overlay");
   el("opacity").disabled = mode !== "overlay";
-  el("tag-view").textContent = VIEW_LABEL[mode];
+  el("tag-view").textContent =
+    mode === "cam" ? el("tab-cam").textContent : VIEW_LABEL[mode];
 }
 el("tab-plain").onclick   = () => setView("plain");
 el("tab-overlay").onclick = () => setView("overlay");
@@ -764,6 +855,7 @@ el("clear").onclick = () => {
   el("stage").classList.add("blank");
   el("result").classList.add("hide"); el("empty").classList.remove("hide");
   el("warn").classList.add("hide"); el("genwarn").classList.add("hide");
+  el("cam-block").classList.add("hide"); el("twin-block").classList.add("hide");
   el("err").textContent = "";
   el("filename").textContent = ""; el("panel-model").textContent = "";
   el("tag-model").textContent = ""; el("tag-view").textContent = "";
@@ -772,7 +864,7 @@ el("clear").onclick = () => {
     .forEach(id => el(id).disabled = true);
 };
 
-el("compare").onchange = () => file && analyse();
+el("compare-select").onchange = () => file && analyse();
 
 /* ---------- modal ---------- */
 function sheet(html) {
@@ -792,6 +884,9 @@ el("about").onclick = () => sheet("<h2>About this prototype</h2>"
   + "the sensitivity of the model, while naming the region in words preserves it.</p>"
   + models.map(m => "<p><strong>" + m.name + "</strong>"
       + (m.available ? "" : " (checkpoint not found)") + "<br>" + m.description + "</p>").join("")
+  + "<h2 style='margin-top:20px'>Saliency methods</h2>"
+  + camMethods.map(m => "<p><strong>" + m.name + "</strong><br>" + m.description
+      + "</p>").join("")
   + "<p>Research prototype produced for a Master thesis. Not a medical device, and not "
   + "validated for clinical use.</p>");
 
@@ -901,6 +996,7 @@ async function saveVlm() {
 el("vlm-btn").onclick = vlmSheet;
 
 loadModels();
+loadCams();
 refreshVlm();
 setInterval(refreshVlm, 60000);
 </script>

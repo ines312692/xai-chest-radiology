@@ -43,6 +43,82 @@ MODELS = {
 
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "densenet")
 
+# ---------------------------------------------------------------------------
+# Saliency methods
+#
+# The five methods hook the same layer, the deepest convolutional block, and differ only
+# in how the activations of that layer are weighted. The scores come from the evaluation
+# notebook of the project, rsna-cam-evaluation, run on the RSNA test set against the
+# bounding boxes of the challenge. Localisation is measured by the mean intersection over
+# union and by the hit rate, faithfulness by deletion, where a low value is better, and by
+# insertion, where a high value is better. The gap between insertion and deletion
+# summarises faithfulness in one number.
+#
+# Score-CAM was produced by the same notebook but its benchmark values are not filled in
+# here. Add them to its metrics dictionary and the interface will display them like the
+# others.
+# ---------------------------------------------------------------------------
+CAM_METHODS = {
+    "gradcam": {
+        "name": "Grad-CAM",
+        "implementation": "GradCAM",
+        "fast": True,
+        "description": ("Gradient weighted average of the last convolutional maps, "
+                        "Selvaraju et al. ICCV 2017. The most faithful of the evaluated "
+                        "methods on the project test set, and the reference of the "
+                        "state of the art table."),
+        "metrics": {"miou": 0.2683, "hit_rate": 0.70, "deletion": 0.6874,
+                    "insertion": 0.9876, "gap": 0.3002},
+    },
+    "gradcampp": {
+        "name": "Grad-CAM++",
+        "implementation": "GradCAMPlusPlus",
+        "fast": True,
+        "description": ("Chattopadhay et al. WACV 2018. Weights each pixel of the "
+                        "gradient rather than the map as a whole, which spreads the "
+                        "attention over multiple foci and raises the hit rate."),
+        "metrics": {"miou": 0.2671, "hit_rate": 0.74, "deletion": 0.7001,
+                    "insertion": 0.9855, "gap": 0.2855},
+    },
+    "layercam": {
+        "name": "LayerCAM",
+        "implementation": "LayerCAM",
+        "fast": True,
+        "description": ("Jiang et al. TIP 2021. Weights the activations element wise, "
+                        "which sharpens the contours. Same hit rate as Grad-CAM++ here, "
+                        "with a slightly lower faithfulness."),
+        "metrics": {"miou": 0.2660, "hit_rate": 0.74, "deletion": 0.7057,
+                    "insertion": 0.9844, "gap": 0.2787},
+    },
+    "eigencam": {
+        "name": "Eigen-CAM",
+        "implementation": "EigenCAM",
+        "fast": True,
+        "description": ("Muhammad and Yeasin IJCNN 2020. First principal component of "
+                        "the activations, so it uses no gradient and is not class "
+                        "discriminative. Lowest faithfulness of the four, which is the "
+                        "expected cost of ignoring the class."),
+        "metrics": {"miou": 0.2310, "hit_rate": 0.72, "deletion": 0.7637,
+                    "insertion": 0.9775, "gap": 0.2138},
+    },
+    "scorecam": {
+        "name": "Score-CAM",
+        "implementation": "ScoreCAM",
+        "fast": False,
+        "description": ("Wang et al. CVPRW 2020. Weights each map by the score obtained "
+                        "when the image is masked by that map, so it needs hundreds of "
+                        "forward passes and takes about a minute on a laptop. It is left "
+                        "out of the side by side comparison for that reason."),
+        "metrics": {},
+    },
+}
+
+DEFAULT_CAM_METHOD = os.getenv("DEFAULT_CAM_METHOD", "gradcam")
+
+# Where the benchmark numbers come from, shown under the scores in the interface
+CAM_METRICS_SOURCE = ("Project benchmark, RSNA test set, bounding boxes of the "
+                      "challenge, notebook rsna-cam-evaluation.")
+
 # Hugging Face identifier of the Vision Language Model producing the textual explanation.
 # MedGemma is the model validated by the project, it needs a GPU and an accepted licence.
 VLM_MODEL_ID = os.getenv("VLM_MODEL_ID", "google/medgemma-4b-it")

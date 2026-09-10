@@ -28,7 +28,8 @@ import torchvision.transforms as T
 from PIL import Image
 from torchvision import models as tv_models
 
-from config import (ENABLE_LOCAL_VLM, IMAGENET_MEAN, IMAGENET_STD, IMG_SIZE, MODELS,
+from config import (CAM_METHODS, CAM_METRICS_SOURCE, DEFAULT_CAM_METHOD,
+                    ENABLE_LOCAL_VLM, IMAGENET_MEAN, IMAGENET_STD, IMG_SIZE, MODELS,
                     REMOTE_VLM_MAX_SIDE, REMOTE_VLM_TIMEOUT, VLM_MODEL_ID,
                     remote_vlm_secret, remote_vlm_url)
 
@@ -51,6 +52,23 @@ def available_models():
         "description": spec["description"],
         "available": os.path.exists(spec["checkpoint"]),
     } for model_id, spec in MODELS.items()]
+
+
+def available_cam_methods():
+    """Describe every saliency method, with the benchmark scores of the project."""
+    return [{
+        "id": method_id,
+        "name": spec["name"],
+        "description": spec["description"],
+        "fast": spec["fast"],
+        "metrics": spec["metrics"],
+    } for method_id, spec in CAM_METHODS.items()]
+
+
+def comparable_cam_methods(excluded=None):
+    """The methods used by the side by side comparison, the slow ones left out."""
+    return [method_id for method_id, spec in CAM_METHODS.items()
+            if spec["fast"] and method_id != excluded]
 
 
 def _build_architecture(arch, num_classes):
@@ -139,18 +157,60 @@ def _overlay_to_base64(overlay_array):
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def classify_and_localize(image, model_id):
-    """Run one classifier and its Grad-CAM.
+def _cam_algorithm(method_id):
+    """Return the class of the library implementing one saliency method."""
+    from pytorch_grad_cam import (EigenCAM, GradCAM, GradCAMPlusPlus, LayerCAM,
+                                  ScoreCAM)
+    registry = {"GradCAM": GradCAM, "GradCAMPlusPlus": GradCAMPlusPlus,
+                "LayerCAM": LayerCAM, "EigenCAM": EigenCAM, "ScoreCAM": ScoreCAM}
+    return registry[CAM_METHODS[method_id]["implementation"]]
+
+
+def _saliency_map(model, spec, tensor, method_id, positive_index):
+    """Compute one saliency map for the pneumonia score.
 
     The map always explains the pneumonia score, so a normal prediction shows which
     regions were inspected and found insufficient to raise that score, rather than a flat
     map that the min max normalisation of the library would stretch into pure noise.
     Activations below the seventieth percentile are cut, so only the regions that
     genuinely drive the score are painted.
+
+    Eigen-CAM ignores the target since it takes the first principal component of the
+    activations rather than a gradient, which is exactly why it is not class
+    discriminative and why its faithfulness is the lowest of the four in the benchmark.
     """
-    from pytorch_grad_cam import GradCAM
-    from pytorch_grad_cam.utils.image import show_cam_on_image
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    algorithm = _cam_algorithm(method_id)
+    cam = algorithm(model=model, target_layers=[_target_layer(model, spec["arch"])])
+    if not CAM_METHODS[method_id]["fast"]:
+        # Score-CAM masks the image once per activation map, so the passes are batched
+        cam.batch_size = 16
+    heatmap = cam(input_tensor=tensor,
+                  targets=[ClassifierOutputTarget(positive_index)])[0]
+
+    threshold = np.percentile(heatmap, 70)
+    return np.clip((heatmap - threshold) / (heatmap.max() - threshold + 1e-8), 0, 1)
+
+
+def _paint(image, heatmap):
+    """Blend one saliency map over the study, at the resolution of the classifier."""
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+
+    display = np.asarray(image.convert("RGB").resize((IMG_SIZE, IMG_SIZE)),
+                         dtype=np.float32) / 255.0
+    return show_cam_on_image(display, heatmap, use_rgb=True, image_weight=0.65)
+
+
+def classify_and_localize(image, model_id, cam_method=DEFAULT_CAM_METHOD,
+                          extra_cam_methods=()):
+    """Run one classifier, then one saliency map per requested method.
+
+    The classification is run once whatever the number of maps, so comparing the methods
+    costs only the extra backward passes and never a second forward pass.
+    """
+    if cam_method not in CAM_METHODS:
+        raise ValueError(f"Unsupported saliency method {cam_method}")
 
     spec = MODELS[model_id]
     model = load_classifier(model_id)
@@ -165,18 +225,28 @@ def classify_and_localize(image, model_id):
                     for name, p in zip(spec["classes"], probabilities)]
 
     positive_index = 1 - spec["classes"].index(spec["negative_class"])
-    cam = GradCAM(model=model, target_layers=[_target_layer(model, spec["arch"])])
-    heatmap = cam(input_tensor=tensor,
-                  targets=[ClassifierOutputTarget(positive_index)])[0]
+    heatmap = _saliency_map(model, spec, tensor, cam_method, positive_index)
+    overlay = _paint(image, heatmap)
 
-    threshold = np.percentile(heatmap, 70)
-    heatmap = np.clip((heatmap - threshold) / (heatmap.max() - threshold + 1e-8), 0, 1)
+    variants = []
+    for method_id in extra_cam_methods:
+        if method_id == cam_method or method_id not in CAM_METHODS:
+            continue
+        try:
+            other = _saliency_map(model, spec, tensor, method_id, positive_index)
+        except Exception as exc:
+            logger.warning("Saliency method %s failed: %s", method_id, exc)
+            continue
+        variants.append({
+            "cam_method": method_id,
+            "cam_method_name": CAM_METHODS[method_id]["name"],
+            "peak_zone": _peak_zone(other),
+            "metrics": CAM_METHODS[method_id]["metrics"],
+            "heatmap_png_base64": _overlay_to_base64(_paint(image, other)),
+        })
 
-    display = np.asarray(image.convert("RGB").resize((IMG_SIZE, IMG_SIZE)),
-                         dtype=np.float32) / 255.0
-    overlay = show_cam_on_image(display, heatmap, use_rgb=True, image_weight=0.65)
     return (label, confidence, overlay, _peak_zone(heatmap), distribution,
-            spec["classes"][positive_index])
+            spec["classes"][positive_index], variants)
 
 
 def _build_prompt(label, confidence, zone):
@@ -358,16 +428,18 @@ def generate_text(image, label, confidence, zone, distribution):
             "structured", warning)
 
 
-def analyze_image(image, model_id, with_text=True):
+def analyze_image(image, model_id, with_text=True, cam_method=DEFAULT_CAM_METHOD,
+                  extra_cam_methods=()):
     """Run the pipeline on one image with one model and return the response payload.
 
-    The comparison mode calls this function once per model with with_text set to false
-    for the secondary one, so both heatmaps are produced without paying twice the cost of
-    text generation.
+    The backbone comparison calls this function once per model with with_text set to
+    false for the secondary ones, so every heatmap is produced without paying twice the
+    cost of text generation. The saliency comparison instead passes extra_cam_methods,
+    which reuses the single classification of this call.
     """
     spec = MODELS[model_id]
-    (label, confidence, overlay, zone, distribution,
-     cam_label) = classify_and_localize(image, model_id)
+    (label, confidence, overlay, zone, distribution, cam_label,
+     variants) = classify_and_localize(image, model_id, cam_method, extra_cam_methods)
     if with_text:
         text, generator, warning = generate_text(image, label, confidence, zone,
                                                  distribution)
@@ -382,6 +454,11 @@ def analyze_image(image, model_id, with_text=True):
         "negative_class": spec["negative_class"],
         "peak_zone": zone,
         "cam_label": cam_label,
+        "cam_method": cam_method,
+        "cam_method_name": CAM_METHODS[cam_method]["name"],
+        "cam_metrics": CAM_METHODS[cam_method]["metrics"],
+        "cam_metrics_source": CAM_METRICS_SOURCE,
+        "cam_variants": variants,
         "explanation_text": text,
         "generator": generator,
         "generator_warning": warning,
