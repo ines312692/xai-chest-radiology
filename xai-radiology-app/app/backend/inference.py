@@ -4,21 +4,6 @@ The module exposes one entry point, analyze_image, which runs the three stages o
 pipeline for a chosen model: classification, visual explanation with Grad-CAM, and
 textual explanation.
 
-Multi model note. Several classifiers can be served side by side. Each one is loaded
-once and cached, so switching model in the interface costs no reloading. Comparing the
-heatmaps of two models on the same radiograph shows how the explanation depends on what
-each model was trained to detect, which is the point of the comparison mode.
-
-Multi class note. Grad-CAM always explains the predicted class specifically, which makes
-the visual explanation class discriminative, the founding property of the method in
-Selvaraju et al. ICCV 2017.
-
-Design note. The ablation study of the project measured that passing the Grad-CAM
-overlay to the Vision Language Model degrades every generation metric and can induce
-hallucinations, the model reading the colored blob as a mass. The service therefore
-sends the clean radiograph to the VLM and transmits the explanation as text, namely the
-predicted class, its confidence and the anatomical zone of strongest activation. The
-overlay is produced for the user interface only.
 """
 import base64
 import io
@@ -48,32 +33,50 @@ _transform = T.Compose([
 
 def available_models():
     """Describe every declared model and whether its checkpoint is present on disk."""
-    described = []
-    for model_id, spec in MODELS.items():
-        described.append({
-            "id": model_id,
-            "name": spec["name"],
-            "classes": spec["classes"],
-            "description": spec["description"],
-            "available": os.path.exists(spec["checkpoint"]),
-        })
-    return described
+    return [{
+        "id": model_id,
+        "name": spec["name"],
+        "classes": spec["classes"],
+        "description": spec["description"],
+        "available": os.path.exists(spec["checkpoint"]),
+    } for model_id, spec in MODELS.items()]
+
+
+def _build_architecture(arch, num_classes):
+    """Instantiate one backbone with a fresh head of the right size.
+
+    The head lives under a different attribute in each family, classifier for DenseNet
+    and fc for ResNet, which is the only architectural difference the service handles.
+    """
+    if arch == "densenet121":
+        model = tv_models.densenet121(weights=None)
+        model.classifier = nn.Linear(model.classifier.in_features, num_classes)
+    elif arch == "resnet50":
+        model = tv_models.resnet50(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+    else:
+        raise ValueError(f"Unsupported architecture {arch}")
+    return model
+
+
+def _target_layer(model, arch):
+    """Return the deepest convolutional block, the layer Grad-CAM must hook.
+
+    Selvaraju et al. ICCV 2017 recommend the last convolutional layer, which holds the
+    highest level spatial semantics. It is features for DenseNet and layer4 for ResNet.
+    """
+    return model.features[-1] if arch == "densenet121" else model.layer4[-1]
 
 
 @lru_cache(maxsize=4)
 def load_classifier(model_id):
-    """Load one DenseNet121 classifier and keep it cached.
-
-    The head is sized from the declared class list, so the same function loads the
-    binary and the four class checkpoints without any code change.
-    """
+    """Load one classifier and keep it cached, so switching model costs no reloading."""
     spec = MODELS[model_id]
-    model = tv_models.densenet121(weights=None)
-    model.classifier = nn.Linear(model.classifier.in_features, len(spec["classes"]))
+    model = _build_architecture(spec["arch"], len(spec["classes"]))
     model.load_state_dict(torch.load(spec["checkpoint"], map_location=DEVICE))
     model.to(DEVICE).eval()
-    logger.info("Model %s loaded from %s with %d classes on %s",
-                model_id, spec["checkpoint"], len(spec["classes"]), DEVICE)
+    logger.info("Model %s (%s) loaded from %s on %s",
+                model_id, spec["arch"], spec["checkpoint"], DEVICE)
     return model
 
 
@@ -82,25 +85,26 @@ def load_vlm():
     """Load the Vision Language Model, quantized when a GPU is available.
 
     Returns None when the model is disabled or cannot be loaded, in which case the
-    service falls back to the rule based writer instead of failing.
+    service falls back to the structured writer instead of failing. MedGemma is gated on
+    Hugging Face, so a token must be available in the environment for it to load.
     """
     if not ENABLE_VLM:
-        logger.warning("VLM disabled by configuration, using the rule based writer")
+        logger.warning("VLM disabled by configuration, using the structured writer")
         return None
     try:
-        from transformers import (AutoProcessor, BitsAndBytesConfig,
-                                  LlavaForConditionalGeneration)
+        from transformers import (AutoProcessor, AutoModelForImageTextToText,
+                                  BitsAndBytesConfig)
         kwargs = {"device_map": "auto"}
         if DEVICE.type == "cuda":
             kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
         processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
-        model = LlavaForConditionalGeneration.from_pretrained(VLM_MODEL_ID, **kwargs)
+        model = AutoModelForImageTextToText.from_pretrained(VLM_MODEL_ID, **kwargs)
         model.eval()
         logger.info("VLM loaded: %s", VLM_MODEL_ID)
         return processor, model
     except Exception as exc:
-        logger.warning("VLM unavailable (%s), using the rule based writer", exc)
+        logger.warning("VLM unavailable (%s), using the structured writer", exc)
         return None
 
 
@@ -127,8 +131,11 @@ def _overlay_to_base64(overlay_array):
 def classify_and_localize(image, model_id):
     """Run one classifier and its Grad-CAM.
 
-    Returns the predicted label, its confidence, the overlay, the peak anatomical zone
-    and the full probability distribution over the classes of that model.
+    The map always explains the pneumonia score, so a normal prediction shows which
+    regions were inspected and found insufficient to raise that score, rather than a flat
+    map that the min max normalisation of the library would stretch into pure noise.
+    Activations below the seventieth percentile are cut, so only the regions that
+    genuinely drive the score are painted.
     """
     from pytorch_grad_cam import GradCAM
     from pytorch_grad_cam.utils.image import show_cam_on_image
@@ -146,92 +153,111 @@ def classify_and_localize(image, model_id):
     distribution = [{"label": name, "probability": round(float(p), 4)}
                     for name, p in zip(spec["classes"], probabilities)]
 
-    cam = GradCAM(model=model, target_layers=[model.features[-1]])
+    positive_index = 1 - spec["classes"].index(spec["negative_class"])
+    cam = GradCAM(model=model, target_layers=[_target_layer(model, spec["arch"])])
     heatmap = cam(input_tensor=tensor,
-                  targets=[ClassifierOutputTarget(predicted_index)])[0]
+                  targets=[ClassifierOutputTarget(positive_index)])[0]
+
+    threshold = np.percentile(heatmap, 70)
+    heatmap = np.clip((heatmap - threshold) / (heatmap.max() - threshold + 1e-8), 0, 1)
 
     display = np.asarray(image.convert("RGB").resize((IMG_SIZE, IMG_SIZE)),
                          dtype=np.float32) / 255.0
-    overlay = show_cam_on_image(display, heatmap, use_rgb=True, image_weight=0.6)
-    return label, confidence, overlay, _peak_zone(heatmap), distribution
+    overlay = show_cam_on_image(display, heatmap, use_rgb=True, image_weight=0.65)
+    return (label, confidence, overlay, _peak_zone(heatmap), distribution,
+            spec["classes"][positive_index])
 
 
 def _build_prompt(label, confidence, zone):
-    """Build the text conditioned prompt validated by the project ablation study.
+    """Build the text conditioned prompt selected by the project experiments.
 
-    The explanation travels as language, and the instruction forbids meta commentary,
-    which was the contamination observed when the model could discuss the overlay.
+    The explanation travels as language, never as pixels, and the instruction forbids
+    meta commentary, which was the contamination observed when the model was free to
+    discuss the overlay.
     """
     readable = label.replace("_", " ").lower()
-    return (f"You are an expert radiologist. A diagnostic system classifies this chest "
-            f"radiograph as {readable} with {confidence:.0%} confidence, the most "
-            f"influential region being the {zone}. Write a short radiology style "
-            f"description of the visible findings in two to four sentences, paying "
-            f"attention to that region and covering the lungs, heart size and pleural "
-            f"spaces. State only what is visible. Describe only the anatomy. Never "
-            f"mention any diagnostic system, model, heatmap, colors or confidence "
-            f"value.")
+    return (f"A diagnostic model classifies this chest radiograph as {readable} with "
+            f"{confidence:.0%} confidence, and its attention is concentrated on the "
+            f"{zone}. Examine that region and write the findings section of a radiology "
+            f"report in three to five sentences, covering the lungs, the heart size and "
+            f"the pleural spaces. State whether the image supports the suggested "
+            f"finding. Describe only the anatomy. Never mention any diagnostic system, "
+            f"model, heatmap, colours or confidence value.")
 
 
-def _rule_based_report(label, zone):
-    """Deterministic fallback used when the VLM is not available.
+def _structured_report(label, confidence, zone, distribution):
+    """Deterministic writer used when the Vision Language Model is not available.
 
-    It keeps the service usable on a laptop, and the degraded mode stays explicit to
-    the caller through the generator field of the response.
+    Sections are separated by a visible marker rather than by a newline alone, because a
+    line break depends on how the client renders the field while a marker survives any
+    rendering. The degraded mode stays explicit to the caller through the generator field
+    of the response.
     """
-    templates = {
-        "NORMAL": (f"No focal consolidation is identified, the analysed regions "
-                   f"including the {zone} showing no evidence of pneumonia."),
-        "Normal": (f"The lung fields appear clear, the analysed regions including the "
-                   f"{zone} showing no evidence of focal consolidation."),
-        "PNEUMONIA": (f"Findings suggest an area of increased opacity in the {zone}, "
-                      f"compatible with a pulmonary consolidation."),
-        "Lung_Opacity": (f"An area of increased opacity is suggested in the {zone}, "
-                         f"compatible with a focal pulmonary process."),
-        "COVID": (f"Findings suggest a pattern of ground glass and patchy opacities, "
-                  f"most prominent in the {zone}, a distribution described in viral "
-                  f"pneumonia of COVID type."),
-        "Viral Pneumonia": (f"Findings suggest a diffuse interstitial pattern involving "
-                            f"the {zone}, a distribution described in viral pneumonia."),
-    }
-    body = templates.get(label, f"The findings are centred on the {zone}.")
-    return (body + " Cardiac silhouette and pleural spaces should be assessed on the "
-                   "original study, and correlation with the clinical presentation is "
-                   "recommended.")
+    is_normal = label.upper() == "NORMAL"
+    runner_up = min(p["probability"] for p in distribution)
+
+    if is_normal:
+        findings = (f"No focal airspace opacity is identified. The analysed regions, "
+                    f"including the {zone} which carried the strongest activation, show "
+                    f"no evidence of consolidation.")
+        impression = (f"No radiographic evidence of pneumonia, with {confidence:.0%} "
+                      f"confidence.")
+    else:
+        findings = (f"There is an area of increased opacity in the {zone}, compatible "
+                    f"with an airspace consolidation. The remaining lung fields "
+                    f"contributed less to the decision.")
+        impression = (f"Appearances compatible with pneumonia, with {confidence:.0%} "
+                      f"confidence.")
+
+    sections = [
+        f"\u25a0 FINDINGS \u2014 {findings} Cardiac silhouette, mediastinal contours and "
+        f"pleural spaces are not assessed by this system and require review on the "
+        f"original study.",
+        f"\u25a0 IMPRESSION \u2014 {impression} The alternative class was scored at "
+        f"{runner_up:.0%}.",
+        f"\u25a0 LIMITATIONS \u2014 This system reports pneumonia only and does not "
+        f"exclude other pathology. It is a research prototype, not a medical device, and "
+        f"every output requires review by a qualified radiologist.",
+    ]
+    return "\n\n".join(sections)
 
 
-def generate_text(image, label, confidence, zone):
-    """Produce the textual explanation, with the rule based writer as fallback."""
+def generate_text(image, label, confidence, zone, distribution):
+    """Produce the textual explanation, with the structured writer as fallback."""
     loaded = load_vlm()
     if loaded is None:
-        return _rule_based_report(label, zone), "rule_based"
+        return _structured_report(label, confidence, zone, distribution), "structured"
 
     processor, model = loaded
-    conversation = [{"role": "user",
-                     "content": [{"type": "image"},
-                                 {"type": "text",
-                                  "text": _build_prompt(label, confidence, zone)}]}]
-    chat = processor.apply_chat_template(conversation, add_generation_prompt=True)
-    inputs = processor(images=image.convert("RGB"), text=chat,
-                       return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=120, do_sample=False)
-    decoded = processor.decode(output[0], skip_special_tokens=True)
-    return decoded.split("ASSISTANT:")[-1].strip(), "vlm"
+    messages = [
+        {"role": "system",
+         "content": [{"type": "text", "text": "You are an expert radiologist."}]},
+        {"role": "user",
+         "content": [{"type": "image", "image": image.convert("RGB")},
+                     {"type": "text",
+                      "text": _build_prompt(label, confidence, zone)}]},
+    ]
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt").to(model.device)
+    length = inputs["input_ids"].shape[-1]
+    with torch.inference_mode():
+        output = model.generate(**inputs, max_new_tokens=220, do_sample=False)
+    return processor.decode(output[0][length:], skip_special_tokens=True).strip(), "vlm"
 
 
 def analyze_image(image, model_id, with_text=True):
     """Run the pipeline on one image with one model and return the response payload.
 
     The comparison mode calls this function once per model with with_text set to false
-    for the secondary model, so the two heatmaps are produced without paying twice the
-    cost of text generation.
+    for the secondary one, so both heatmaps are produced without paying twice the cost of
+    text generation.
     """
     spec = MODELS[model_id]
-    label, confidence, overlay, zone, distribution = classify_and_localize(
-        image, model_id)
+    (label, confidence, overlay, zone, distribution,
+     cam_label) = classify_and_localize(image, model_id)
     if with_text:
-        text, generator = generate_text(image, label, confidence, zone)
+        text, generator = generate_text(image, label, confidence, zone, distribution)
     else:
         text, generator = None, None
     return {
@@ -242,6 +268,7 @@ def analyze_image(image, model_id, with_text=True):
         "probabilities": distribution,
         "negative_class": spec["negative_class"],
         "peak_zone": zone,
+        "cam_label": cam_label,
         "explanation_text": text,
         "generator": generator,
         "heatmap_png_base64": _overlay_to_base64(overlay),
